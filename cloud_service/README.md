@@ -1,7 +1,8 @@
 # Cloud assistant service
 
 This service runs without the Windows laptop. It supports a 6:00 AM daily
-briefing call, conversational voice turns, reminders, task history, and Gmail
+briefing call, conversational voice turns, persistent pending/ongoing tasks,
+reminders, task history, and Gmail
 background review. When Gmail is connected, it checks unread mail every 15
 minutes and saves reply drafts for messages that appear to need a personal
 response. It never marks messages read or sends automatically.
@@ -50,7 +51,12 @@ Set these on the Railway service. Keep values out of source control.
 - `ASSISTANT_TIMEZONE`: defaults to `Asia/Kolkata`; briefing at 06:00.
 
 Attach a Railway volume at `/data`, and use one replica to avoid duplicate
-scheduler jobs. Gmail stays idle until the owner completes one-time OAuth.
+scheduler jobs. The 06:00 briefing uses `ASSISTANT_TIMEZONE` (default
+`Asia/Kolkata`). The owner can speak during the call to add a tracked task,
+change its status, ask about reminders, or set a reminder; speech turns use the
+same cloud conversation tools as `/api/chat`. A reminder only triggers a phone
+call when the owner explicitly requests a call. Gmail stays idle until the
+owner completes one-time OAuth.
 
 ## Endpoints
 
@@ -59,6 +65,7 @@ scheduler jobs. Gmail stays idle until the owner completes one-time OAuth.
 - `POST /api/google/credentials`: authenticated OAuth token handoff from desktop.
 - `GET /api/google/status`: Gmail connection and pending draft subjects.
 - `POST /api/reminders`, `GET /api/reminders`: durable reminders.
+- `POST /api/tasks`, `GET /api/tasks`, `PATCH /api/tasks/status`: tracked tasks.
 - `POST /api/task-events`, `GET /api/briefing`: overnight event history and preview.
 - `/dashboard`: private owner dashboard, review inbox, memory and connection management.
 - `POST /twilio/turn`: Twilio signed speech webhook.
