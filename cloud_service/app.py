@@ -59,6 +59,10 @@ VONAGE_APPLICATION_ID = os.environ.get("VONAGE_APPLICATION_ID", "")
 VONAGE_PRIVATE_KEY = os.environ.get("VONAGE_PRIVATE_KEY", "")
 VONAGE_SIGNATURE_SECRET = os.environ.get("VONAGE_SIGNATURE_SECRET", "")
 VONAGE_FROM_NUMBER = os.environ.get("VONAGE_FROM_NUMBER", "")
+VAPI_API_KEY = os.environ.get("VAPI_API_KEY", "")
+VAPI_ASSISTANT_ID = os.environ.get("VAPI_ASSISTANT_ID", "")
+VAPI_PHONE_NUMBER_ID = os.environ.get("VAPI_PHONE_NUMBER_ID", "")
+VAPI_SERVER_SECRET = os.environ.get("VAPI_SERVER_SECRET", "")
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.send"]
 
 app = FastAPI(title="Personal Assistant Cloud Service", docs_url=None, redoc_url=None)
@@ -783,6 +787,8 @@ def _voice_calls_configured() -> bool:
         ))
     if VOICE_PROVIDER == "twilio":
         return all((TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OWNER_PHONE_NUMBER, PUBLIC_BASE_URL))
+    if VOICE_PROVIDER == "vapi":
+        return all((VAPI_API_KEY, VAPI_ASSISTANT_ID, VAPI_PHONE_NUMBER_ID, VAPI_SERVER_SECRET, OWNER_PHONE_NUMBER))
     return False
 
 
@@ -839,7 +845,91 @@ def _voice_call(body: str) -> str:
         return _vonage_call(body)
     if VOICE_PROVIDER == "twilio":
         return _twilio_call(body)
-    raise RuntimeError("VOICE_PROVIDER must be 'vonage' or 'twilio'.")
+    if VOICE_PROVIDER == "vapi":
+        return _vapi_call(body)
+    raise RuntimeError("VOICE_PROVIDER must be 'vonage', 'twilio', or 'vapi'.")
+
+
+def _vapi_call(body: str) -> str:
+    if not _voice_calls_configured():
+        raise RuntimeError("Vapi voice configuration is incomplete.")
+    response = requests.post(
+        "https://api.vapi.ai/call",
+        headers={"Authorization": f"Bearer {VAPI_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "assistantId": VAPI_ASSISTANT_ID,
+            "phoneNumberId": VAPI_PHONE_NUMBER_ID,
+            "customer": {"number": OWNER_PHONE_NUMBER},
+            "assistantOverrides": {"firstMessage": body[:1000]},
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    call_id = str(response.json().get("id", ""))
+    if not call_id:
+        raise RuntimeError("Vapi did not return a call ID.")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO voice_calls(call_id,prompt,created_at) VALUES(?,?,?)",
+            (call_id, body[:1500], _now().isoformat()),
+        )
+    return call_id
+
+
+def _vapi_call_id(message: dict[str, Any]) -> str:
+    call = message.get("call") if isinstance(message.get("call"), dict) else {}
+    return str(call.get("id", ""))
+
+
+@app.post("/vapi/webhook")
+async def vapi_webhook(request: Request) -> dict[str, Any]:
+    """Route Vapi assistant tool calls into the existing cloud assistant brain."""
+    supplied = request.headers.get("x-vapi-secret", "")
+    if not VAPI_SERVER_SECRET or not hmac.compare_digest(supplied, VAPI_SERVER_SECRET):
+        raise HTTPException(status_code=403, detail="Invalid Vapi webhook credential.")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Vapi webhook payload.")
+    message = payload.get("message", {}) if isinstance(payload, dict) else {}
+    if not isinstance(message, dict):
+        raise HTTPException(status_code=400, detail="Invalid Vapi message.")
+    if message.get("type") != "tool-calls":
+        return {"received": True}
+
+    call_id = _vapi_call_id(message)
+    if not call_id:
+        raise HTTPException(status_code=400, detail="Vapi call identifier is missing.")
+    with _connect() as conn:
+        known_call = conn.execute("SELECT 1 FROM voice_calls WHERE call_id=?", (call_id,)).fetchone()
+    if not known_call:
+        raise HTTPException(status_code=403, detail="This call was not started by the assistant service.")
+
+    results = []
+    for item in message.get("toolCallList", []):
+        if not isinstance(item, dict):
+            continue
+        fn = item.get("function", {}) if isinstance(item.get("function"), dict) else {}
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if fn.get("name") != "assistant_turn" or not isinstance(args, dict):
+            results.append({"toolCallId": item.get("id", ""), "error": "Unknown or invalid assistant tool call."})
+            continue
+        user_request = str(args.get("request", "")).strip()[:4000]
+        if not user_request:
+            result = "Please say what you would like me to do."
+        else:
+            try:
+                result = _claude_turn(call_id, user_request)
+            except Exception:
+                log.exception("Vapi assistant tool call failed")
+                result = "I couldn't complete that request just now. Please try again later."
+        results.append({"toolCallId": item.get("id", ""), "result": result})
+    return {"results": results}
 
 
 def _twilio_call(body: str) -> str:
