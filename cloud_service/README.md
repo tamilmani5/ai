@@ -1,7 +1,8 @@
 # Cloud assistant service
 
 This service runs without the Windows laptop. It supports a 6:00 AM daily
-briefing call, conversational voice turns, persistent pending/ongoing tasks,
+briefing call through Vonage Voice API by default, conversational voice turns,
+persistent pending/ongoing tasks,
 reminders, task history, and Gmail
 background review. When Gmail is connected, it checks unread mail every 15
 minutes and saves reply drafts for messages that appear to need a personal
@@ -46,9 +47,19 @@ Set these on the Railway service. Keep values out of source control.
 - `ASSISTANT_API_TOKEN`: random secret for `/api/*` routes.
 - `ANTHROPIC_API_KEY`: cloud language-model credential.
 - `GMAIL_TOKEN_ENCRYPTION_KEY`: Fernet key used to encrypt Gmail credentials.
-- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `OWNER_PHONE_NUMBER`.
+- `VOICE_PROVIDER=vonage` (default), `VONAGE_API_KEY`, `VONAGE_APPLICATION_ID`,
+  `VONAGE_PRIVATE_KEY`, `VONAGE_SIGNATURE_SECRET`, `VONAGE_FROM_NUMBER`,
+  `OWNER_PHONE_NUMBER`.
 - `PUBLIC_BASE_URL`: public HTTPS service URL.
 - `ASSISTANT_TIMEZONE`: defaults to `Asia/Kolkata`; briefing at 06:00.
+
+Vonage needs a Voice API application with signed webhooks enabled and a number
+or verified caller ID assigned to the account. Store the downloaded private
+key in Railway as `VONAGE_PRIVATE_KEY`, with newlines preserved or represented
+as `\\n`. International calls to India are supported, while domestic calls
+from a local Indian caller ID are not supported by Vonage. To keep the previous
+Twilio adapter instead, set `VOICE_PROVIDER=twilio` and provide the four
+`TWILIO_*` variables.
 
 Attach a Railway volume at `/data`, and use one replica to avoid duplicate
 scheduler jobs. The 06:00 briefing uses `ASSISTANT_TIMEZONE` (default
@@ -69,4 +80,5 @@ owner completes one-time OAuth.
 - `POST /api/task-events`, `GET /api/briefing`: overnight event history and preview.
 - `/dashboard`: private owner dashboard, review inbox, memory and connection management.
 - `POST /twilio/turn`: Twilio signed speech webhook.
+- `POST /vonage/answer`, `POST /vonage/turn`, `POST /vonage/event`: signed Vonage Voice API webhooks.
 

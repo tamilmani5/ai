@@ -31,8 +31,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
-from twilio.request_validator import RequestValidator
-from twilio.rest import Client
+try:
+    from twilio.request_validator import RequestValidator
+    from twilio.rest import Client
+except ImportError:  # Vonage deployments can run without the Twilio SDK installed.
+    RequestValidator = None
+    Client = None
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("assistant.cloud")
@@ -49,6 +53,12 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 OWNER_PHONE_NUMBER = os.environ.get("OWNER_PHONE_NUMBER", "")
 GMAIL_TOKEN_ENCRYPTION_KEY = os.environ.get("GMAIL_TOKEN_ENCRYPTION_KEY", "")
+VOICE_PROVIDER = os.environ.get("VOICE_PROVIDER", "vonage").strip().lower()
+VONAGE_API_KEY = os.environ.get("VONAGE_API_KEY", "")
+VONAGE_APPLICATION_ID = os.environ.get("VONAGE_APPLICATION_ID", "")
+VONAGE_PRIVATE_KEY = os.environ.get("VONAGE_PRIVATE_KEY", "")
+VONAGE_SIGNATURE_SECRET = os.environ.get("VONAGE_SIGNATURE_SECRET", "")
+VONAGE_FROM_NUMBER = os.environ.get("VONAGE_FROM_NUMBER", "")
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.send"]
 
 app = FastAPI(title="Personal Assistant Cloud Service", docs_url=None, redoc_url=None)
@@ -106,6 +116,15 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS service_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS voice_calls (
+                call_id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS vonage_webhook_jtis (
+                jti TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS gmail_state (
                 message_id TEXT PRIMARY KEY,
@@ -756,9 +775,78 @@ def _claude_turn(session_id: str, user_text: str) -> str:
     return fallback
 
 
+def _voice_calls_configured() -> bool:
+    if VOICE_PROVIDER == "vonage":
+        return all((
+            VONAGE_API_KEY, VONAGE_APPLICATION_ID, VONAGE_PRIVATE_KEY,
+            VONAGE_SIGNATURE_SECRET, VONAGE_FROM_NUMBER, OWNER_PHONE_NUMBER, PUBLIC_BASE_URL,
+        ))
+    if VOICE_PROVIDER == "twilio":
+        return all((TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OWNER_PHONE_NUMBER, PUBLIC_BASE_URL))
+    return False
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _vonage_jwt() -> str:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    key_pem = VONAGE_PRIVATE_KEY.replace("\\n", "\n").encode("utf-8")
+    private_key = serialization.load_pem_private_key(key_pem, password=None)
+    now = int(time.time())
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = _b64url(json.dumps({
+        "application_id": VONAGE_APPLICATION_ID, "iat": now,
+        "exp": now + 300, "jti": str(uuid.uuid4()),
+    }, separators=(",", ":")).encode())
+    signing_input = f"{header}.{payload}".encode("ascii")
+    signature = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    return f"{header}.{payload}.{_b64url(signature)}"
+
+
+def _vonage_call(body: str) -> str:
+    if not _voice_calls_configured():
+        raise RuntimeError("Vonage voice configuration is incomplete.")
+    response = requests.post(
+        "https://api.nexmo.com/v1/calls",
+        headers={"Authorization": f"Bearer {_vonage_jwt()}", "Content-Type": "application/json"},
+        json={
+            "to": [{"type": "phone", "number": OWNER_PHONE_NUMBER.lstrip("+")}],
+            "from": {"type": "phone", "number": VONAGE_FROM_NUMBER.lstrip("+")},
+            "answer_url": [f"{PUBLIC_BASE_URL}/vonage/answer"],
+            "answer_method": "POST",
+            "event_url": [f"{PUBLIC_BASE_URL}/vonage/event"],
+            "event_method": "POST",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    call_id = str(response.json().get("uuid", ""))
+    if not call_id:
+        raise RuntimeError("Vonage did not return a call ID.")
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO voice_calls(call_id,prompt,created_at) VALUES(?,?,?)",
+            (call_id, body[:1500], _now().isoformat()),
+        )
+    return call_id
+
+
+def _voice_call(body: str) -> str:
+    if VOICE_PROVIDER == "vonage":
+        return _vonage_call(body)
+    if VOICE_PROVIDER == "twilio":
+        return _twilio_call(body)
+    raise RuntimeError("VOICE_PROVIDER must be 'vonage' or 'twilio'.")
+
+
 def _twilio_call(body: str) -> str:
     if not all((TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OWNER_PHONE_NUMBER, PUBLIC_BASE_URL)):
         raise RuntimeError("Twilio and public URL configuration is incomplete.")
+    if Client is None:
+        raise RuntimeError("The Twilio SDK is not installed.")
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     call = client.calls.create(to=OWNER_PHONE_NUMBER, from_=TWILIO_PHONE_NUMBER, twiml=_twiml_say(body))
     return call.sid
@@ -766,7 +854,7 @@ def _twilio_call(body: str) -> str:
 
 def _morning_call_job() -> None:
     try:
-        call_sid = _twilio_call(_morning_briefing())
+        call_sid = _voice_call(_morning_briefing())
         with _connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO service_state(key, value) VALUES ('last_morning_call', ?)",
@@ -779,7 +867,7 @@ def _morning_call_job() -> None:
 
 def _due_reminder_job() -> None:
     """Call for reminders only when the owner explicitly requested a call."""
-    if not all((TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OWNER_PHONE_NUMBER, PUBLIC_BASE_URL)):
+    if not _voice_calls_configured():
         return
     now = _now().isoformat()
     with _connect() as conn:
@@ -792,7 +880,7 @@ def _due_reminder_job() -> None:
         reminder_ids = [row["id"] for row in rows]
         prompt = "Your requested reminder is due: " + "; ".join(row["task"] for row in rows) + "."
         try:
-            call_sid = _twilio_call(prompt)
+            call_sid = _voice_call(prompt)
         except Exception:
             log.exception("A due reminder call could not be started")
             return
@@ -805,12 +893,68 @@ def _due_reminder_job() -> None:
 
 def _valid_twilio_request(request: Request, form: dict[str, str]) -> bool:
     signature = request.headers.get("X-Twilio-Signature", "")
-    if not TWILIO_AUTH_TOKEN or not signature or not PUBLIC_BASE_URL:
+    if RequestValidator is None or not TWILIO_AUTH_TOKEN or not signature or not PUBLIC_BASE_URL:
         return False
     url = PUBLIC_BASE_URL + request.url.path
     if request.url.query:
         url += "?" + request.url.query
     return RequestValidator(TWILIO_AUTH_TOKEN).validate(url, form, signature)
+
+
+def _valid_vonage_request(request: Request) -> bool:
+    authorization = request.headers.get("authorization", "")
+    if not VONAGE_API_KEY or not VONAGE_SIGNATURE_SECRET or not authorization.startswith("Bearer "):
+        return False
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        header_b64, payload_b64, signature_b64 = token.split(".")
+        header = json.loads(base64.urlsafe_b64decode(header_b64 + "=" * (-len(header_b64) % 4)))
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)))
+        signature = base64.urlsafe_b64decode(signature_b64 + "=" * (-len(signature_b64) % 4))
+        if header.get("alg") != "HS256" or str(claims.get("api_key", "")) != VONAGE_API_KEY or claims.get("iss") != "Vonage":
+            return False
+        issued_at = int(claims.get("iat", 0))
+        if issued_at < int(time.time()) - 86400 or issued_at > int(time.time()) + 60:
+            return False
+        expected = hmac.new(
+            VONAGE_SIGNATURE_SECRET.encode("utf-8"), f"{header_b64}.{payload_b64}".encode("ascii"), hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(signature, expected):
+            return False
+        jti = str(claims.get("jti", ""))
+        if not jti:
+            return False
+        with _connect() as conn:
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO vonage_webhook_jtis(jti,created_at) VALUES(?,?)",
+                (jti, _now().isoformat()),
+            ).rowcount
+        return inserted == 1
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return False
+
+
+def _phone_digits(value: str) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _vonage_owner_call(data: dict[str, Any]) -> bool:
+    return (
+        _phone_digits(data.get("from", "")) == _phone_digits(VONAGE_FROM_NUMBER)
+        and _phone_digits(data.get("to", "")) == _phone_digits(OWNER_PHONE_NUMBER)
+    )
+
+
+def _vonage_input_ncco(call_id: str, prompt: str) -> list[dict[str, Any]]:
+    event_url = f"{PUBLIC_BASE_URL}/vonage/turn"
+    return [
+        {"action": "talk", "text": prompt[:1450], "language": "en-IN"},
+        {
+            "action": "input", "type": ["speech"], "eventUrl": [event_url], "eventMethod": "POST",
+            "speech": {"language": "en-IN", "startTimeout": 10, "endOnSilence": 2, "maxDuration": 45},
+        },
+        {"action": "talk", "text": "I did not catch that. Goodbye.", "language": "en-IN"},
+    ]
 
 
 class ChatRequest(BaseModel):
@@ -952,7 +1096,7 @@ def dashboard_summary(request: Request) -> dict[str, Any]:
     return {
         "integrations": {
             "gmail": _gmail_status()["connected"],
-            "cloud_voice_calls": all((TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OWNER_PHONE_NUMBER, PUBLIC_BASE_URL)),
+            "cloud_voice_calls": _voice_calls_configured(),
             "cloud_model": bool(ANTHROPIC_API_KEY),
             "whatsapp": "laptop_only",
             "instagram": "laptop_only",
@@ -1112,7 +1256,7 @@ def healthz() -> dict[str, Any]:
     return {
         "status": "ok",
         "timezone": APP_TIMEZONE,
-        "morning_call_configured": all((TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, OWNER_PHONE_NUMBER, PUBLIC_BASE_URL)),
+        "morning_call_configured": _voice_calls_configured(),
         "language_model_configured": bool(ANTHROPIC_API_KEY),
         "gmail_connected": _gmail_status()["connected"],
     }
@@ -1239,5 +1383,62 @@ async def twilio_turn(request: Request) -> Response:
             log.exception("Voice turn failed")
             reply = "I couldn't complete that request just now. Please try again later."
     return Response(_twiml_say(reply), media_type="application/xml")
+
+
+@app.post("/vonage/answer")
+async def vonage_answer(request: Request) -> Response:
+    if not _valid_vonage_request(request):
+        raise HTTPException(status_code=403, detail="Invalid Vonage webhook signature.")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid call payload.")
+    if not isinstance(data, dict) or not _vonage_owner_call(data):
+        return Response(
+            content=json.dumps([{"action": "talk", "text": "This assistant call is restricted to its owner."}, {"action": "hangup"}]),
+            media_type="application/json",
+        )
+    call_id = str(data.get("uuid", ""))
+    if not call_id:
+        raise HTTPException(status_code=400, detail="Call identifier is missing.")
+    with _connect() as conn:
+        row = conn.execute("SELECT prompt FROM voice_calls WHERE call_id=?", (call_id,)).fetchone()
+    prompt = row["prompt"] if row else _morning_briefing()
+    return Response(content=json.dumps(_vonage_input_ncco(call_id, prompt)), media_type="application/json")
+
+
+@app.post("/vonage/turn")
+async def vonage_turn(request: Request) -> Response:
+    if not _valid_vonage_request(request):
+        raise HTTPException(status_code=403, detail="Invalid Vonage webhook signature.")
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid voice input payload.")
+    if not isinstance(data, dict) or not _vonage_owner_call(data):
+        return Response(
+            content=json.dumps([{"action": "talk", "text": "This assistant call is restricted to its owner."}, {"action": "hangup"}]),
+            media_type="application/json",
+        )
+    call_id = str(data.get("uuid", ""))
+    speech_block = data.get("speech", {}) if isinstance(data.get("speech", {}), dict) else {}
+    results = speech_block.get("results", [])
+    speech = str(results[0].get("text", "")).strip() if results and isinstance(results[0], dict) else ""
+    if speech and call_id:
+        try:
+            reply = _claude_turn(call_id, speech)
+        except Exception:
+            log.exception("Vonage voice turn failed")
+            reply = "I couldn't complete that request just now. Please try again later."
+    else:
+        reply = "I didn't catch that. You can ask about pending tasks or tell me a task to track."
+    return Response(content=json.dumps(_vonage_input_ncco(call_id, reply)), media_type="application/json")
+
+
+@app.post("/vonage/event")
+async def vonage_event(request: Request) -> dict[str, str]:
+    if not _valid_vonage_request(request):
+        raise HTTPException(status_code=403, detail="Invalid Vonage webhook signature.")
+    return {"status": "received"}
 
 
