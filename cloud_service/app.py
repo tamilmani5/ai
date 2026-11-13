@@ -94,6 +94,14 @@ def _init_db() -> None:
                 outcome TEXT NOT NULL,
                 occurred_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS assistant_tasks (
+                id TEXT PRIMARY KEY,
+                task TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS assistant_tasks_status_idx ON assistant_tasks(status, updated_at);
             CREATE INDEX IF NOT EXISTS task_events_time_idx ON task_events(occurred_at);
             CREATE TABLE IF NOT EXISTS service_state (
                 key TEXT PRIMARY KEY,
@@ -263,6 +271,9 @@ def _morning_briefing() -> str:
         reminders = conn.execute(
             "SELECT task, due_at FROM reminders WHERE status = 'pending' ORDER BY due_at LIMIT 8"
         ).fetchall()
+        tasks = conn.execute(
+            "SELECT task, status FROM assistant_tasks WHERE status IN ('pending','ongoing') ORDER BY updated_at DESC LIMIT 12"
+        ).fetchall()
         gmail_drafts = conn.execute("SELECT subject, sender FROM gmail_state WHERE status='drafted' ORDER BY created_at DESC LIMIT 5").fetchall()
 
     completed = [row["task"] for row in events if row["outcome"] == "completed"]
@@ -274,6 +285,12 @@ def _morning_briefing() -> str:
         parts.append("I have no completed cloud tasks recorded in the last 12 hours.")
     if attempted:
         parts.append("Needs attention: " + "; ".join(attempted[:4]) + ".")
+    pending_tasks = [row["task"] for row in tasks if row["status"] == "pending"]
+    ongoing_tasks = [row["task"] for row in tasks if row["status"] == "ongoing"]
+    if pending_tasks:
+        parts.append("Pending tasks: " + "; ".join(pending_tasks[:6]) + ".")
+    if ongoing_tasks:
+        parts.append("Ongoing tasks: " + "; ".join(ongoing_tasks[:6]) + ".")
     if reminders:
         local_items = []
         for row in reminders:
@@ -336,6 +353,55 @@ def _pending_reminders() -> list[dict[str, str]]:
             "SELECT id, task, due_at, notify_by FROM reminders WHERE status = 'pending' ORDER BY due_at LIMIT 30"
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _create_task(task: str) -> dict[str, str]:
+    task = task.strip()
+    if not task or len(task) > 500:
+        raise ValueError("A task from 1 to 500 characters is required.")
+    task_id = str(uuid.uuid4())
+    now = _now().isoformat()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO assistant_tasks(id, task, status, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?)",
+            (task_id, task, now, now),
+        )
+    return {"id": task_id, "task": task, "status": "pending"}
+
+
+def _list_tasks(status_filter: str = "all") -> list[dict[str, str]]:
+    if status_filter not in {"all", "pending", "ongoing", "completed"}:
+        raise ValueError("Status must be all, pending, ongoing, or completed.")
+    with _connect() as conn:
+        if status_filter == "all":
+            rows = conn.execute(
+                "SELECT id, task, status, created_at, updated_at FROM assistant_tasks ORDER BY updated_at DESC LIMIT 50"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, task, status, created_at, updated_at FROM assistant_tasks WHERE status=? ORDER BY updated_at DESC LIMIT 50",
+                (status_filter,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _update_task_status(task: str, new_status: str) -> dict[str, str]:
+    task = task.strip()
+    if not task or new_status not in {"pending", "ongoing", "completed"}:
+        raise ValueError("Provide a task name and status: pending, ongoing, or completed.")
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, task FROM assistant_tasks WHERE lower(task)=lower(?) AND status != 'completed' ORDER BY updated_at DESC LIMIT 2",
+            (task,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("No single active task matches that exact task name.")
+        row = rows[0]
+        conn.execute(
+            "UPDATE assistant_tasks SET status=?, updated_at=? WHERE id=?",
+            (new_status, _now().isoformat(), row["id"]),
+        )
+    return {"id": row["id"], "task": row["task"], "status": new_status}
 
 
 def _fernet():
@@ -462,6 +528,36 @@ def _gmail_draft_job() -> None:
 
 _TOOLS = [
     {
+        "name": "create_task",
+        "description": "Add a task the owner explicitly asked you to track. New tasks start as pending and appear in the morning call.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task": {"type": "string", "description": "Concise task title."}},
+            "required": ["task"],
+        },
+    },
+    {
+        "name": "list_tasks",
+        "description": "List tracked tasks, including pending and ongoing work. Use when asked what remains or what is in progress.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"status": {"type": "string", "enum": ["all", "pending", "ongoing", "completed"]}},
+            "required": [],
+        },
+    },
+    {
+        "name": "update_task_status",
+        "description": "Update an existing tracked task when the owner says it has started, is still pending, or is completed. Must match the exact task title.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "Exact task title previously recorded."},
+                "status": {"type": "string", "enum": ["pending", "ongoing", "completed"]},
+            },
+            "required": ["task", "status"],
+        },
+    },
+    {
         "name": "create_reminder",
         "description": "Create a reminder for the owner. Only use when the owner requested a reminder or deadline.",
         "input_schema": {
@@ -556,11 +652,11 @@ def _claude_turn(session_id: str, user_text: str) -> str:
     }
     system_prompt = (
         "You are a personal assistant speaking to the account owner. Be conversational, concise, and truthful. "
-        "Use tools for requested reminders, task history, and preferences. Remember a preference only when asked. "
+        "Use tools for task tracking, requested reminders, task history, and preferences. When the owner assigns a task to track, create it as pending; update it to ongoing or completed only when the owner says so. Remember a preference only when asked. "
         "Use web search for current, changing, unfamiliar, or explicitly researched questions. Cite the sources you use; "
         "distinguish sourced facts from your own inference. "
         "Do not claim a message was sent, an account was checked, "
-        "or a computer task was completed unless a connected tool actually did it. The cloud service supports reminders, "
+        "or a computer task was completed unless a connected tool actually did it. The cloud service supports task tracking, reminders, "
         "task history, durable preferences, and connected Gmail. Gmail is checked in the background when connected and "
         "replies may be saved as drafts without approval. "
         "Never send an email unless the owner explicitly approves sending a specific draft by subject in the current turn. "
@@ -617,7 +713,13 @@ def _claude_turn(session_id: str, user_text: str) -> str:
             args = call.get("input", {})
             is_error = False
             try:
-                if call["name"] == "create_reminder":
+                if call["name"] == "create_task":
+                    output = _create_task(str(args.get("task", "")))
+                elif call["name"] == "list_tasks":
+                    output = _list_tasks(str(args.get("status", "all")))
+                elif call["name"] == "update_task_status":
+                    output = _update_task_status(str(args.get("task", "")), str(args.get("status", "")))
+                elif call["name"] == "create_reminder":
                     output = _add_reminder(
                         str(args.get("task", "")), int(args.get("minutes", 0)),
                         bool(args.get("call_when_due", False)),
@@ -720,6 +822,15 @@ class TaskEvent(BaseModel):
     task: str = Field(min_length=1, max_length=500)
     outcome: str = Field(pattern="^(completed|failed|needs_attention)$")
     occurred_at: datetime | None = None
+
+
+class TrackedTaskRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=500)
+
+
+class TaskStatusRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=500)
+    status: str = Field(pattern="^(pending|ongoing|completed)$")
 
 
 class ReminderRequest(BaseModel):
@@ -847,6 +958,7 @@ def dashboard_summary(request: Request) -> dict[str, Any]:
             "instagram": "laptop_only",
         },
         "pending_drafts": _gmail_status()["pending_drafts"],
+        "tasks": _list_tasks("all"),
         "reminders": _pending_reminders(),
         "needs_attention": [dict(row) for row in attention],
         "preferences": _list_preferences(),
@@ -1028,6 +1140,30 @@ def add_reminder(body: ReminderRequest, authorization: str | None = Header(defau
 def list_reminders(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_api_token(authorization)
     return {"reminders": _pending_reminders()}
+
+
+@app.post("/api/tasks", status_code=status.HTTP_201_CREATED)
+def create_tracked_task(body: TrackedTaskRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    _require_api_token(authorization)
+    return _create_task(body.task)
+
+
+@app.get("/api/tasks")
+def list_tracked_tasks(status_filter: str = "all", authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_api_token(authorization)
+    try:
+        return {"tasks": _list_tasks(status_filter)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.patch("/api/tasks/status")
+def update_tracked_task(body: TaskStatusRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    _require_api_token(authorization)
+    try:
+        return _update_task_status(body.task, body.status)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @app.post("/api/task-events", status_code=status.HTTP_201_CREATED)
