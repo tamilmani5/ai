@@ -1,5 +1,12 @@
+# Secrets and local runtime data
 .env
-*.env
+.env.*
+!.env.example
+credentials.json
+data/
 *.sqlite3
 *.db
 __pycache__/
+.venv/
+*.py[cod]
+*.pem
