@@ -1,38 +1,47 @@
 # Cloud assistant service
 
-This is a separate cloud process for tasks that must keep working while the
-Windows voice client is closed. It currently supports a 6:00 AM daily briefing
-call, a spoken conversation during that call, task-history queries, and durable
-reminder creation. It does not yet connect Gmail, WhatsApp, or Instagram.
+This service runs without the Windows laptop. It supports a 6:00 AM daily
+briefing call, conversational voice turns, reminders, task history, and Gmail
+background review. When Gmail is connected, it checks unread mail every 15
+minutes and saves reply drafts for messages that appear to need a personal
+response. It never marks messages read or sends automatically.
+
+## Gmail consent and send approval
+
+Connect Gmail once from the desktop assistant by saying **connect Gmail**.
+Google opens a sign-in and consent page. The desktop app sends the resulting
+offline refresh token to this service over HTTPS; the service encrypts it at
+rest in its Railway volume. Google may ask again if access is revoked or the
+refresh grant expires. The Gmail integration needs read-only, compose, and send
+scopes because approved drafts can be sent during a voice conversation.
+
+The cloud assistant may read mail and save reply drafts without asking each
+time. It must never send until the owner explicitly says “send” and identifies
+the draft by its exact subject in the same turn. A morning call lists pending
+draft subjects and confirms none were sent. Email text is treated as untrusted
+content and cannot override assistant instructions.
 
 ## Required Railway variables
 
-Set these on the Railway service. Do not put their values in source control.
+Set these on the Railway service. Keep values out of source control.
 
-- `ASSISTANT_API_TOKEN`: long random secret required by `/api/*` routes.
-- `ANTHROPIC_API_KEY`: cloud language-model credential for chat and voice turns.
-- `ANTHROPIC_MODEL`: optional; defaults to `claude-sonnet-4-6`.
-- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`: Twilio Voice credentials.
-- `OWNER_PHONE_NUMBER`: owner's number in E.164 format.
-- `PUBLIC_BASE_URL`: public HTTPS URL for this service, without a trailing slash.
-- `ASSISTANT_TIMEZONE`: defaults to `Asia/Kolkata`; the briefing runs at 06:00.
-- `CLOUD_DB_PATH`: optional; defaults to `/data/assistant.sqlite3`.
+- `ASSISTANT_API_TOKEN`: random secret for `/api/*` routes.
+- `ANTHROPIC_API_KEY`: cloud language-model credential.
+- `GMAIL_TOKEN_ENCRYPTION_KEY`: Fernet key used to encrypt Gmail credentials.
+- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `OWNER_PHONE_NUMBER`.
+- `PUBLIC_BASE_URL`: public HTTPS service URL.
+- `ASSISTANT_TIMEZONE`: defaults to `Asia/Kolkata`; briefing at 06:00.
 
-Attach a Railway volume at `/data` before relying on reminders/task history.
-Set the service to one replica to avoid duplicate scheduled calls. The scheduled
-call is disabled in practice until the required Twilio variables are present.
+Attach a Railway volume at `/data`, and use one replica to avoid duplicate
+scheduler jobs. Gmail stays idle until the owner completes one-time OAuth.
 
 ## Endpoints
 
-- `GET /healthz`: readiness and feature-configuration status, no secret values.
-- `POST /api/chat`: authenticated conversational turn. JSON: `{"text":"...","session_id":"optional"}`.
-- `POST /api/reminders`: authenticated reminder. JSON: `{"task":"...","minutes":10,"call_when_due":false}`. Set `true` only when the owner explicitly requested a call when it is due.
-- `GET /api/reminders`: authenticated list of pending reminders.
-- `POST /api/task-events`: authenticated task outcome for the morning briefing.
-- `GET /api/briefing`: authenticated preview of the current briefing.
-- `POST /twilio/turn`: Twilio signed speech webhook used during the phone call.
-
-The service does not send messages or place arbitrary calls. It asks the model
-to be clear when a requested account integration is not connected. Only the
-scheduled wake-up call is implemented here.
+- `GET /healthz`: service and integration readiness, no secret values.
+- `POST /api/chat`: authenticated conversation.
+- `POST /api/google/credentials`: authenticated OAuth token handoff from desktop.
+- `GET /api/google/status`: Gmail connection and pending draft subjects.
+- `POST /api/reminders`, `GET /api/reminders`: durable reminders.
+- `POST /api/task-events`, `GET /api/briefing`: overnight event history and preview.
+- `POST /twilio/turn`: Twilio signed speech webhook.
 
