@@ -1219,7 +1219,15 @@ async def twilio_turn(request: Request) -> Response:
     if not _valid_twilio_request(request, form):
         raise HTTPException(status_code=403, detail="Invalid voice webhook signature.")
     caller = form.get("From", "")
-    if not OWNER_PHONE_NUMBER or caller != OWNER_PHONE_NUMBER:
+    callee = form.get("To", "")
+    # Twilio reports the assistant's number as From on the scheduled outbound
+    # wake-up call and the owner's number as To. For inbound calls, the owner
+    # must be From and the configured Twilio number must be To.
+    owner_call = bool(OWNER_PHONE_NUMBER) and (
+        (caller == TWILIO_PHONE_NUMBER and callee == OWNER_PHONE_NUMBER)
+        or (caller == OWNER_PHONE_NUMBER and callee == TWILIO_PHONE_NUMBER)
+    )
+    if not owner_call:
         return Response(_twiml_say("This assistant call is restricted to its owner.", gather=False), media_type="application/xml")
     speech = form.get("SpeechResult", "").strip()
     if not speech:
