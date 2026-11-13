@@ -6,6 +6,23 @@ background review. When Gmail is connected, it checks unread mail every 15
 minutes and saves reply drafts for messages that appear to need a personal
 response. It never marks messages read or sends automatically.
 
+The service also provides a phone-friendly owner dashboard at `/dashboard`.
+Sign in with the same `ASSISTANT_API_TOKEN` configured for the desktop app. It
+shows cloud connection status, reminders, needs-attention events, pending Gmail
+drafts, encrypted preferences, and saved chat history. A user must review a
+Gmail draft and confirm its recipient and subject before sending from the
+dashboard. Gmail can be revoked there by typing `DISCONNECT GMAIL`.
+
+Cloud conversation history and saved preferences are encrypted in SQLite using
+a key derived from `ASSISTANT_API_TOKEN`. Keep that token stable to retain
+access to saved memory; changing it makes older encrypted memory unreadable.
+The dashboard login uses a 12-hour secure, HTTP-only cookie and does not store
+the access token in browser storage. Keep the persistent Railway volume mounted
+at `/data`.
+
+Cloud chat can use Anthropic web search for current or explicitly researched
+questions and returns source links. Searches consume Anthropic API usage.
+
 ## Gmail consent and send approval
 
 Connect Gmail once from the desktop assistant by saying **connect Gmail**.
@@ -43,5 +60,6 @@ scheduler jobs. Gmail stays idle until the owner completes one-time OAuth.
 - `GET /api/google/status`: Gmail connection and pending draft subjects.
 - `POST /api/reminders`, `GET /api/reminders`: durable reminders.
 - `POST /api/task-events`, `GET /api/briefing`: overnight event history and preview.
+- `/dashboard`: private owner dashboard, review inbox, memory and connection management.
 - `POST /twilio/turn`: Twilio signed speech webhook.
 
