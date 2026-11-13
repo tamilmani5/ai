@@ -1,7 +1,7 @@
 # Cloud assistant service
 
 This service runs without the Windows laptop. It supports a 6:00 AM daily
-briefing call through Vonage Voice API by default, conversational voice turns,
+briefing call through Vonage Voice API by default, with Vapi and Twilio options, conversational voice turns,
 persistent pending/ongoing tasks,
 reminders, task history, and Gmail
 background review. When Gmail is connected, it checks unread mail every 15
@@ -50,6 +50,8 @@ Set these on the Railway service. Keep values out of source control.
 - `VOICE_PROVIDER=vonage` (default), `VONAGE_API_KEY`, `VONAGE_APPLICATION_ID`,
   `VONAGE_PRIVATE_KEY`, `VONAGE_SIGNATURE_SECRET`, `VONAGE_FROM_NUMBER`,
   `OWNER_PHONE_NUMBER`.
+- For Vapi, set `VOICE_PROVIDER=vapi`, `VAPI_API_KEY`, `VAPI_ASSISTANT_ID`,
+  `VAPI_PHONE_NUMBER_ID`, `VAPI_SERVER_SECRET`, and `OWNER_PHONE_NUMBER`.
 - `PUBLIC_BASE_URL`: public HTTPS service URL.
 - `ASSISTANT_TIMEZONE`: defaults to `Asia/Kolkata`; briefing at 06:00.
 
@@ -60,6 +62,41 @@ as `\\n`. International calls to India are supported, while domestic calls
 from a local Indian caller ID are not supported by Vonage. To keep the previous
 Twilio adapter instead, set `VOICE_PROVIDER=twilio` and provide the four
 `TWILIO_*` variables.
+
+### Vapi setup
+
+Create and publish a Vapi assistant, then import a phone number that supports
+outbound calls. Vapi free phone numbers do not support outbound calls. In the
+assistant's system prompt, instruct it to use the `assistant_turn` function for
+requests that need the cloud assistant's task, reminder, or Gmail capabilities.
+Add this function to the assistant's model tools:
+
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "assistant_turn",
+    "description": "Ask the owner's cloud personal assistant to handle a request or answer using its task, reminder, and Gmail tools. Use for each substantive user request.",
+    "parameters": {
+      "type": "object",
+      "properties": { "request": { "type": "string", "description": "The owner's request in their own words." } },
+      "required": ["request"]
+    }
+  }
+}
+```
+
+Set the assistant's Webhook Server URL to
+`https://<your-railway-domain>/vapi/webhook`. Add an `X-Vapi-Secret` custom
+credential in Vapi with the same random value as `VAPI_SERVER_SECRET`. Add that
+same value as a Railway variable; do not put it in the URL. Set the Vapi API
+key, published assistant ID, and imported phone-number ID in Railway. The call
+endpoint always calls the configured `OWNER_PHONE_NUMBER`, not a model-provided
+destination. Vapi sends `assistant_turn` requests to the webhook, which forwards
+them to the cloud assistant's existing conversational tools and returns its
+answer. In Railway, set `VOICE_PROVIDER=vapi`, review staged changes, and
+deploy. You can then check `GET /healthz` for `morning_call_configured` before
+relying on the scheduled call.
 
 Attach a Railway volume at `/data`, and use one replica to avoid duplicate
 scheduler jobs. The 06:00 briefing uses `ASSISTANT_TIMEZONE` (default
@@ -81,4 +118,5 @@ owner completes one-time OAuth.
 - `/dashboard`: private owner dashboard, review inbox, memory and connection management.
 - `POST /twilio/turn`: Twilio signed speech webhook.
 - `POST /vonage/answer`, `POST /vonage/turn`, `POST /vonage/event`: signed Vonage Voice API webhooks.
+- `POST /vapi/webhook`: authenticated Vapi server webhook for assistant tools.
 
